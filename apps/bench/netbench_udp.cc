@@ -85,11 +85,13 @@ void ServerWorker(rt::UdpConn *c) {
 // the main function of Server.
 void ServerHandler(void *arg) {
   std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
+  // std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Dial(cltaddr, raddr));
   if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
   char buf[10005];
   while (true) {
     netaddr raddr;
+    printf("Server receiving..\n");
     ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
     printf("Recieved %ld from %d\n", ret, raddr.ip);
   }
@@ -387,12 +389,16 @@ void DoExperiment(double req_rate) {
 // Client main: run experiments 10 times.
 void ClientHandler(void *arg) {
   
+  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Dial({0, 0}, raddr));
+  if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
-  int cnt = 10;
+  int cnt = 10000;
   char buf[1000];
   while (--cnt) {
     int len = rand() % 50 + 50;
-    ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
+    // ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
+    ssize_t ret = c->WriteTo(buf, len, &srvaddr[0]);
+    rt::Sleep(1000);
     printf("asd123www Sending: %ld\n", ret);
   }
   return;
