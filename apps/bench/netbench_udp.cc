@@ -36,11 +36,18 @@ constexpr uint64_t kMaxCatchUpUS = 5;
 int threads;
 // the remote UDP address of the server.
 netaddr raddr;
+netaddr cltaddr;
+netaddr srvaddr[10];
 // the number of samples to gather.
 uint64_t n;
 // the mean service time in us.
 double st;
 
+// Paxos-state
+uint32_t view;
+
+
+// ------------------------------------ server-side code ------------------------------------
 void ServerWorker(rt::UdpConn *c) {
   union {
     unsigned char buf[rt::UdpConn::kMaxPayloadSize];
@@ -75,9 +82,18 @@ void ServerWorker(rt::UdpConn *c) {
   }
 }
 
+// the main function of Server.
 void ServerHandler(void *arg) {
   std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
   if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
+
+  char buf[10005];
+  while (true) {
+    netaddr raddr;
+    ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
+    printf("Recieved %ld from %d\n", ret, raddr.ip);
+  }
+  return;
 
   while (true) {
     nbench_req req;
@@ -102,8 +118,8 @@ void ServerHandler(void *arg) {
       std::vector<std::unique_ptr<rt::UdpConn>> conns;
       for (int i = 0; i < req.nports; ++i) {
         std::unique_ptr<rt::UdpConn> cin(rt::UdpConn::Dial({0, 0}, raddr));
-	if (unlikely(cin == nullptr)) panic("couldn't dial data connection");
-	resp.ports[i] = cin->LocalAddr().port;
+        if (unlikely(cin == nullptr)) panic("couldn't dial data connection");
+        resp.ports[i] = cin->LocalAddr().port;
         threads.emplace_back(rt::Thread(std::bind(ServerWorker, cin.get())));
         conns.emplace_back(std::move(cin));
       }
@@ -124,6 +140,16 @@ void ServerHandler(void *arg) {
   }
 }
 
+
+
+
+
+
+
+
+
+// ------------------------------------ client-side code ------------------------------------
+// Close the connection.
 void KillConn(rt::UdpConn *c)
 {
   constexpr int kKillRetries = 10;
@@ -136,6 +162,8 @@ void KillConn(rt::UdpConn *c)
     udp_send(buf, sizeof(buf), c->LocalAddr(), c->RemoteAddr());
 }
 
+
+// Sending requests.
 std::vector<double> PoissonWorker(rt::UdpConn *c, double req_rate,
                                   double service_time, rt::WaitGroup *starter)
 {
@@ -229,6 +257,10 @@ std::vector<double> PoissonWorker(rt::UdpConn *c, double req_rate,
   return timings;
 }
 
+
+
+
+// build udp connection, send request and get reply.
 std::vector<double> RunExperiment(double req_rate, double *reqs_per_sec) {
   std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Dial({0, 0}, raddr));
   if (c == nullptr) panic("couldn't establish control connection");
@@ -252,6 +284,7 @@ std::vector<double> RunExperiment(double req_rate, double *reqs_per_sec) {
   // Create one UDP connection per thread.
   std::vector<std::unique_ptr<rt::UdpConn>> conns;
   for (int i = 0; i < threads; ++i) {
+    // create local address, because it's client, port number arbitrary.
     std::unique_ptr<rt::UdpConn>
       outc(rt::UdpConn::Dial(c->LocalAddr(), {raddr.ip, resp.ports[i]}));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
@@ -310,8 +343,11 @@ std::vector<double> RunExperiment(double req_rate, double *reqs_per_sec) {
   return timings;
 }
 
+
+
+// One epoch, calculate tail latency.
 void DoExperiment(double req_rate) {
-  constexpr int kRounds = 1;
+  constexpr int kRounds = 1; // only one round.
   std::vector<double> timings;
   double reqs_per_sec = 0;
   for (int i = 0; i < kRounds; i++) {
@@ -346,16 +382,36 @@ void DoExperiment(double req_rate) {
             << " max: "    << max << std::endl;
 }
 
+
+
+// Client main: run experiments 10 times.
 void ClientHandler(void *arg) {
+  
+
+  int cnt = 10;
+  char buf[1000];
+  while (--cnt) {
+    int len = rand() % 50 + 50;
+    ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
+    printf("asd123www Sending: %ld\n", ret);
+  }
+  return;
+
+  
   for (double i = 500000; i <= 5000000; i += 500000)
     DoExperiment(i);
 }
 
+
+// ipv4: convert string to u32.
 int StringToAddr(const char *str, uint32_t *addr) {
   uint8_t a, b, c, d;
 
-  if(sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) != 4)
+  if(sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) != 4) {
+    puts("Failed in parsing ipv4 addr");
+    exit(-1);
     return -EINVAL;
+  }
 
   *addr = MAKE_IP_ADDR(a, b, c, d);
   return 0;
@@ -371,8 +427,23 @@ int main(int argc, char *argv[]) {
     return -EINVAL;
   }
 
+  // Setting cluster.
+  StringToAddr("10.10.1.2", &cltaddr.ip);
+  StringToAddr("10.10.1.3", &srvaddr[0].ip);
+  StringToAddr("10.10.1.4", &srvaddr[1].ip);
+  StringToAddr("10.10.1.1", &srvaddr[2].ip);
+  StringToAddr("10.10.1.6", &srvaddr[3].ip);
+  StringToAddr("10.10.1.5", &srvaddr[4].ip);
+  StringToAddr("10.10.1.7", &srvaddr[5].ip);
+  StringToAddr("10.10.1.8", &srvaddr[6].ip);
+  cltaddr.port = kNetbenchPort;
+  for (int i = 0; i < 7; ++i) srvaddr[i].port = kNetbenchPort;
+  view = 0;
+
+
   std::string cmd = argv[2];
   if (cmd.compare("server") == 0) {
+    puts("I'm running server!");
     ret = runtime_init(argv[1], ServerHandler, NULL);
     if (ret) {
       printf("failed to start runtime\n");
@@ -389,6 +460,7 @@ int main(int argc, char *argv[]) {
     return -EINVAL;
   }
 
+  // # of client, each-one is a closed loop request sender.
   threads = std::stoi(argv[3], nullptr, 0);
 
   ret = StringToAddr(argv[4], &raddr.ip);
@@ -406,3 +478,14 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+/*
+Compiling your code:
+    make -C apps/bench
+
+Client: 
+    sudo ./iokerneld simple
+    sudo ./apps/bench/netbench_udp client.config client 10 10.10.1.3 100000 1
+Server: 
+    sudo ./iokerneld simple
+    sudo ./apps/bench/netbench_udp server.config server
+*/
