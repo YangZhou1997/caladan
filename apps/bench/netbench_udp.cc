@@ -13,6 +13,11 @@ extern "C" {
 #include "fake_worker.h"
 #include "proto.h"
 
+
+// protocol-buffer
+#include "netbench_udp_protobuf.h"
+
+
 #include <iostream>
 #include <iomanip>
 #include <utility>
@@ -42,6 +47,10 @@ netaddr srvaddr[10];
 uint64_t n;
 // the mean service time in us.
 double st;
+
+
+
+int32_t idx; // idx in cluster, client is -1.
 
 // Paxos-state
 uint32_t view;
@@ -94,54 +103,14 @@ void ServerHandler(void *arg) {
     printf("Server receiving..\n");
     ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
     printf("Recieved %ld from %d\n", ret, raddr.ip);
+    ret = udp_send(buf, ret, srvaddr[0], cltaddr);
+    if (ret == -1) {
+      puts("Failed sending reply!");fflush(stdout);
+      exit(0);
+    }
   }
   return;
-
-  while (true) {
-    nbench_req req;
-    netaddr raddr;
-    ssize_t ret = c->ReadFrom(&req, sizeof(req), &raddr);
-    if (ret != sizeof(req) || req.magic != kMagic) continue;
-
-    rt::Spawn([=, &c]{
-      log_info("got connection %x:%d, %d ports", raddr.ip,
-               raddr.port, req.nports);
-
-      union {
-        nbench_resp resp;
-        char buf[rt::UdpConn::kMaxPayloadSize];
-      };
-      resp.magic = kMagic;
-      resp.nports = req.nports;
-
-      std::vector<rt::Thread> threads;
-
-      // Create the worker threads.
-      std::vector<std::unique_ptr<rt::UdpConn>> conns;
-      for (int i = 0; i < req.nports; ++i) {
-        std::unique_ptr<rt::UdpConn> cin(rt::UdpConn::Dial({0, 0}, raddr));
-        if (unlikely(cin == nullptr)) panic("couldn't dial data connection");
-        resp.ports[i] = cin->LocalAddr().port;
-        threads.emplace_back(rt::Thread(std::bind(ServerWorker, cin.get())));
-        conns.emplace_back(std::move(cin));
-      }
-
-      // Send the port numbers to the client.
-      ssize_t len = sizeof(nbench_resp) + sizeof(uint16_t) * req.nports;
-      if (len > static_cast<ssize_t>(rt::UdpConn::kMaxPayloadSize))
-        panic("too big");
-      ssize_t ret = c->WriteTo(&resp, len, &raddr);
-      if (ret != len) {
-        log_err("udp write failed, ret = %ld", ret);
-      }
-
-      for (auto& t: threads)
-        t.Join();
-      log_info("done");
-    });
-  }
 }
-
 
 
 
@@ -386,26 +355,26 @@ void DoExperiment(double req_rate) {
 
 
 
-// Client main: run experiments 10 times.
 void ClientHandler(void *arg) {
-  
-  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Dial({0, 0}, raddr));
+  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
   if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
-  int cnt = 10000;
-  char buf[1000];
+  // a simplified client, need to add warmup in the future.
+  int cnt = 10;
+  char buf[3000];
   while (--cnt) {
     int len = rand() % 50 + 50;
-    // ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
-    ssize_t ret = c->WriteTo(buf, len, &srvaddr[0]);
-    rt::Sleep(1000);
-    printf("asd123www Sending: %ld\n", ret);
+    printf("Sending: %d\n", len);
+    ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
+    if (ret == -1) {
+      puts("Failed sending request!");fflush(stdout);
+      exit(0);
+    }
+    ret = c->ReadFrom(buf, 3e3, &raddr);
+    printf("Received: %ld\n", ret);
+    // received one request.
   }
   return;
-
-  
-  for (double i = 500000; i <= 5000000; i += 500000)
-    DoExperiment(i);
 }
 
 
@@ -433,6 +402,11 @@ int main(int argc, char *argv[]) {
     return -EINVAL;
   }
 
+  specpaxos::vr::proto::PrepareMessage prepare;
+  prepare.set_view(1);
+
+  printf("view: %d\n", prepare.view());
+
   // Setting cluster.
   StringToAddr("10.10.1.2", &cltaddr.ip);
   StringToAddr("10.10.1.3", &srvaddr[0].ip);
@@ -446,35 +420,19 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < 7; ++i) srvaddr[i].port = kNetbenchPort;
   view = 0;
 
-
   std::string cmd = argv[2];
   if (cmd.compare("server") == 0) {
     puts("I'm running server!");
+    idx = std::stoi(argv[3], nullptr, 0);
     ret = runtime_init(argv[1], ServerHandler, NULL);
     if (ret) {
-      printf("failed to start runtime\n");
+      printf("Server: failed to start runtime\n");
       return ret;
     }
   } else if (cmd.compare("client") != 0) {
     std::cerr << "invalid command: " << cmd << std::endl;
     return -EINVAL;
   }
-
-  if (argc != 7) {
-    std::cerr << "usage: [cfg_file] client [#threads] [remote_ip] [n] [service_us]"
-              << std::endl;
-    return -EINVAL;
-  }
-
-  // # of client, each-one is a closed loop request sender.
-  threads = std::stoi(argv[3], nullptr, 0);
-
-  ret = StringToAddr(argv[4], &raddr.ip);
-  if (ret) return -EINVAL;
-  raddr.port = kNetbenchPort;
-
-  n = std::stoll(argv[5], nullptr, 0);
-  st = std::stod(argv[6], nullptr);
 
   ret = runtime_init(argv[1], ClientHandler, NULL);
   if (ret) {
@@ -490,8 +448,8 @@ Compiling your code:
 
 Client: 
     sudo ./iokerneld simple
-    sudo ./apps/bench/netbench_udp client.config client 10 10.10.1.3 100000 1
+    sudo ./apps/bench/netbench_udp client.config client
 Server: 
     sudo ./iokerneld simple
-    sudo ./apps/bench/netbench_udp server.config server
+    sudo ./apps/bench/netbench_udp server.config server idx
 */

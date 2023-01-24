@@ -2,6 +2,9 @@
 ROOT_PATH=../..
 include $(ROOT_PATH)/build/shared.mk
 
+PROTOBUF_CFLAGS := $(shell pkg-config --cflags protobuf)
+CFLAGS += $(PROTOBUF_CFLAGS)
+
 fake_worker_src = fake_worker.cc
 fake_worker_obj = $(fake_worker_src:.cc=.o)
 
@@ -40,6 +43,12 @@ storage_bench_obj = $(storage_bench_src:.cc=.o)
 
 netbench2_src = netbench2.cc
 netbench2_obj = $(netbench2_src:.cc=.o)
+
+# add protocol buffer
+netbench_udp_requestpb_src = netbench_udp_requestpb.cc
+netbench_udp_request_obj = $(netbench_udp_requestpb_src:.cc=.o)
+netbench_udp_protobuf_src = netbench_udp_protobuf.cc
+netbench_udp_pb_obj = $(netbench_udp_protobuf_src:.cc=.o)
 
 netbench_udp_src = netbench_udp.cc
 netbench_udp_obj = $(netbench_udp_src:.cc=.o)
@@ -103,9 +112,15 @@ netbench2: $(netbench2_obj) $(fake_worker_obj) $(librt_libs) $(RUNTIME_DEPS)
 	$(LDXX) -o $@ $(LDFLAGS) $(fake_worker_obj) $(netbench2_obj) \
 	$(librt_libs) $(RUNTIME_LIBS)
 
-netbench_udp: $(netbench_udp_obj) $(fake_worker_obj) $(librt_libs) $(RUNTIME_DEPS)
+# netbench_udp_request: $(netbench_udp_request_obj)
+# 	$(LDXX) -o $@ $(LDFLAGS) $(shell pkg-config --cflags --libs protobuf) $(netbench_udp_request_obj)
+
+# netbench_udp_pb: netbench_udp_protobuf.cc
+# 	g++ -o netbench_udp_protobuf.cc $(netbench_udp_pb_obj) -std=c++11 -pthread -lprotobuf
+
+netbench_udp: $(netbench_udp_obj) $(fake_worker_obj) $(librt_libs) $(RUNTIME_DEPS) $(netbench_udp_request_obj) $(netbench_udp_pb_obj) 
 	$(LDXX) -o $@ $(LDFLAGS) $(fake_worker_obj) $(netbench_udp_obj) \
-	$(librt_libs) $(RUNTIME_LIBS)
+	$(librt_libs) $(RUNTIME_LIBS) $(netbench_udp_pb_obj) $(netbench_udp_request_obj) -lpthread -lprotobuf
 
 netbench_linux: $(netbench_linux_obj) $(fake_worker_obj)
 	$(LDXX) -o $@ $(LDFLAGS) $(fake_worker_obj) $(netbench_linux_obj) -lpthread
@@ -122,6 +137,8 @@ src = $(fake_worker_src) $(tbench_src) $(callibrate_src) $(memcached_router_src)
 src += $(stress_src) $(efficiency_src) $(efficiency_linux_src) $(netbench_src) $(flash_client_src)
 src += $(netbench2_src) $(netbench_udp_src) $(netbench_linux_src) $(netperf_src)
 src += $(linux_mech_bench_src) $(storage_bench_src)
+src += $(netbench_udp_requestpb_src) $(netbench_udp_protobuf_src)
+
 obj = $(src:.cc=.o)
 dep = $(obj:.o=.d)
 
