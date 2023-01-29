@@ -108,6 +108,16 @@ public:
 		}
 	}
 
+    bool SetStatus(opnum_t op, LogEntryState state) {
+        LogEntry *entry = Find(op);
+        if (entry == NULL) {
+            return false;
+        }
+
+        entry->state = state;
+        return true;
+    }
+
     LogEntry & Append(viewstamp_t vs, const specpaxos::Request &req, LogEntryState state) {
 		if (entries.empty()) {
 			ASSERT(vs.opnum == start);
@@ -159,15 +169,9 @@ constexpr uint64_t kDiscardSamples = 1000;
 constexpr uint64_t kMaxCatchUpUS = 5;
 
 // the number of worker threads to spawn.
-int threads;
-// the remote UDP address of the server.
-netaddr raddr;
+uint32_t threads;
 netaddr cltaddr;
 netaddr srvaddr[10];
-// the number of samples to gather.
-uint64_t n;
-// the mean service time in us.
-double st;
 
 const uint32_t STATUS_NORMAL = 0;
 const uint32_t STATUS_VIEW_CHANGE = 1;
@@ -264,6 +268,55 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m, char **out)
     return totalLen;
 }
 
+void CommitUpTo(opnum_t upto) { // we can apply these requests in state machine!
+    while (lastCommitted < upto) {
+        lastCommitted++;
+
+        /* Find operation in log */
+        const LogEntry *entry = log.Find(lastCommitted);
+        if (!entry) {
+            puts("Did not find operation in log");
+            exit(-1);
+        }
+
+        specpaxos::vr::proto::ReplyMessage reply;
+        // if we have an upper-layer application.
+        // Execute(lastCommitted, entry->request, reply);
+
+        reply.set_view(entry->viewstamp.view);
+        reply.set_opnum(entry->viewstamp.opnum);
+        reply.set_clientreqid(entry->request.clientreqid());
+        
+        /* Mark it as committed */
+        log.SetStatus(lastCommitted, LOG_STATE_COMMITTED);
+
+        // Store reply in the client table
+        ClientTableEntry &cte =
+            clientTable[entry->request.clientid()];
+        if (cte.lastReqId <= entry->request.clientreqid()) {
+            cte.lastReqId = entry->request.clientreqid();
+            cte.replied = true;
+            cte.reply = reply;            
+        } else {
+            // We've subsequently prepared another operation from the
+            // same client. So this request must have been completed
+            // at the client, and there's no need to record the
+            // result.
+        }
+
+        /* Send reply */
+        auto iter = clientAddresses.find(entry->request.clientid());
+        if (iter != clientAddresses.end()) {
+            char *buf;
+            size_t msgLen = SerializeMessage(reply, &buf);
+            ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], iter->second);
+            if (ret == -1) {
+                puts("Failed to send reply message to client");
+            }
+            delete [] buf;
+        }
+    }
+}
 
 void HandleRequest(const netaddr &remote,
                    const specpaxos::vr::proto::RequestMessage &msg) {
@@ -442,12 +495,12 @@ void HandlePrepareOK(const netaddr &remote,
 		// speculative replies in SpecPaxos...
 	}
     vsmessages[msg.replicaidx()] = msg;
-    int count = vsmessages.size();
+    uint32_t count = vsmessages.size();
 	if (count >= QUORUM_SIZE - 1) {
 		if (count >= QUORUM_SIZE) return;
 
 		ASSERT(msg.opnum() == lastCommitted + 1);
-		++lastCommitted;
+        CommitUpTo(msg.opnum());
 		/*
          * Send COMMIT message to the other replicas.
          *
@@ -509,7 +562,7 @@ void HandleCommit(const netaddr &remote,
         return;
     }
 
-	// CommitUpTo(msg.opnum());
+	CommitUpTo(msg.opnum());
 }
 
 void ReceiveMessage(const netaddr &remote, const std::string &type, const std::string &data) {
@@ -568,64 +621,67 @@ void ServerHandler(void *arg) {
 
 
 // ------------------------------------ client-side code ------------------------------------
-void SendRequest(std::string request_str, uint32_t clientid, uint32_t &clientReqId, int32_t &count) {
+std::string request_str[CLUSTER_SIZE];
+uint32_t clientReqId[CLUSTER_SIZE];
+
+void SendRequest(uint32_t clientid) {
     specpaxos::vr::proto::RequestMessage reqMsg;
-    reqMsg.mutable_req()->set_op(request_str);
+    reqMsg.mutable_req()->set_op(request_str[clientid]);
     reqMsg.mutable_req()->set_clientid(clientid);
-    reqMsg.mutable_req()->set_clientreqid(clientReqId);
-    
-    // XXX Try sending only to (what we think is) the leader first
-    transport->SendMessageToAll(this, reqMsg);
-    
-    requestTimeout->Reset();
+    reqMsg.mutable_req()->set_clientreqid(clientReqId[clientid]);
 
-	int len = rand() % 50 + 50;
-	ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
-	if (ret == -1) {
-		puts("Failed sending request!");fflush(stdout);
-		exit(0);
+    char *buf;
+    size_t msgLen = SerializeMessage(reqMsg, &buf);
+	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
+		ssize_t ret = udp_send(buf, msgLen, cltaddr, srvaddr[i]);
+		if (ret == -1) {
+			puts("Failed sending request!");
+			break;
+		}
 	}
+	delete [] buf;
 }
 
-void HandleReply(const netaddr &remote,
+void HandleReply(const uint32_t clientid,
+                 const netaddr &remote,
                  const specpaxos::vr::proto::ReplyMessage &msg) {
-    if (pendingRequest == NULL) {
-        Warning("Received reply when no request was pending");
+    
+    if (msg.clientreqid() != clientReqId[clientid]) {
+        puts("Received reply for a different request");
         return;
     }
-    if (msg.clientreqid() != ) {
-        ("Received reply for a different request");
-        return;
-    }
-	
+    // Closed-loop.
+    SendRequest(clientid);
 }
 
-void ClientReceiveMessage(const netaddr &remote, const std::string &type, const std::string &data) {
+void ClientReceiveMessage(const uint32_t clientid,
+                          const netaddr &remote, 
+                          const std::string &type, 
+                          const std::string &data) {
     static specpaxos::vr::proto::ReplyMessage reply;
     
     if (type == reply.GetTypeName()) {
         reply.ParseFromString(data);
-        HandleReply(remote, reply);
+        HandleReply(clientid, remote, reply);
     } else {
 		puts("Unknow message in client!");
 		exit(-1);
     }
 }
 
-void ClientHandler(void *arg) {
-	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
+void ClientMain(uint32_t clientid, uint8_t port) {
+	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
 	if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
 	// initialize state.
-	std::string request_str = std::string("sdf");
-	uint32_t clientid = 0;
-	uint32_t clientReqId = 0;
+    request_str[clientid] = std::string("sdf");
+    clientReqId[clientid] = 0;
 
 	// a simplified client, need to add warmup in the future.
 	int32_t total_requests = 10;
 	char buf[10005];
 
-	SendRequest(request_str, clientid, clientReqId, total_requests);
+	SendRequest(clientid);
 	while (total_requests) {
 		netaddr raddr;
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
@@ -635,9 +691,16 @@ void ClientHandler(void *arg) {
         payload = payload + sizeof(uint64_t);
         std::string type(payload, typeLen);
         std::string data(payload + typeLen, ret - sizeof(uint64_t) - typeLen);
-        ClientReceiveMessage(raddr, type, data);
+        ClientReceiveMessage(clientid, raddr, type, data);
 	}
 	return;
+}
+
+void ClientHandler(void *arg) {
+    // spawn one thread for each client.
+    for (uint32_t i = 0; i < threads; ++i) {
+        
+    }
 }
 
 } // anonymous namespace
