@@ -29,8 +29,127 @@ extern "C" {
 #include <random>
 #include <string>
 
+typedef uint64_t view_t;
+typedef uint64_t opnum_t;
+
+#define ASSERT(x) do {\
+	if (!(x)) \
+		exit(-1); \
+} while (0)
+
+
 
 namespace {
+
+enum LogEntryState {
+    LOG_STATE_COMMITTED,
+    LOG_STATE_PREPARED,
+    LOG_STATE_SPECULATIVE,      // specpaxos only
+    LOG_STATE_FASTPREPARED      // fastpaxos only
+};
+
+struct viewstamp_t {
+    view_t view;
+    opnum_t opnum;
+
+    viewstamp_t() : view(0), opnum(0) {}
+    viewstamp_t(view_t view, opnum_t opnum) : view(view), opnum(opnum) {}
+};
+
+class Log {
+    
+public:
+	struct LogEntry {
+        viewstamp_t viewstamp;
+        LogEntryState state;
+        specpaxos::Request request;
+        std::string hash;
+        // Speculative client table stuff
+        opnum_t prevClientReqOpnum;
+        ::google::protobuf::Message *replyMessage;
+    
+        LogEntry() { replyMessage = NULL; }
+        LogEntry(const LogEntry &x)
+            : viewstamp(x.viewstamp), state(x.state), request(x.request),
+              hash(x.hash), prevClientReqOpnum(x.prevClientReqOpnum)
+            {
+                if (x.replyMessage) {
+                    replyMessage = x.replyMessage->New();
+                    replyMessage->CopyFrom(*x.replyMessage);
+                } else {
+                    replyMessage = NULL;
+                }
+            }
+        LogEntry(viewstamp_t viewstamp, LogEntryState state,
+                 const specpaxos::Request &request, const std::string &hash=std::string(20, '\0')) 
+            : viewstamp(viewstamp), state(state), request(request),
+              hash(hash), replyMessage(NULL) { }
+        virtual ~LogEntry()
+            {
+                if (replyMessage) {
+                    delete replyMessage;
+                }
+            }
+    };
+
+	opnum_t LastOpnum() const {
+		if (entries.empty()) {
+			return start-1;
+		} else {
+			return entries.back().viewstamp.opnum;
+		}
+	}
+
+	std::string & LastHash() {
+		if (entries.empty()) {
+			return initialHash;
+		} else {
+			return entries.back().hash;
+		}
+	}
+
+    LogEntry & Append(viewstamp_t vs, const specpaxos::Request &req, LogEntryState state) {
+		if (entries.empty()) {
+			ASSERT(vs.opnum == start);
+		} else {
+			ASSERT(vs.opnum == LastOpnum()+1);
+		}
+
+		std::string prevHash = LastHash();
+		entries.push_back(LogEntry(vs, state, req));
+		if (useHash) {
+			puts("We don't need hashing!");
+			exit(-1);      
+		}
+		
+		return entries.back();
+	}
+    LogEntry * Find(opnum_t opnum) {
+		if (entries.empty()) {
+			return NULL;
+		}
+
+		if (opnum < start) {
+			return NULL;
+		}
+
+		if (opnum-start > entries.size()-1) {
+			return NULL;
+		}
+
+		LogEntry *entry = &entries[opnum-start];
+		ASSERT(entry->viewstamp.opnum == opnum);
+		return entry;
+	}
+    
+private:
+    std::vector<LogEntry> entries;
+	std::string initialHash;
+    opnum_t start;
+    bool useHash;
+};
+
+typedef Log::LogEntry LogEntry;
 
 using sec = std::chrono::duration<double, std::micro>;
 
@@ -54,10 +173,26 @@ const uint32_t STATUS_NORMAL = 0;
 const uint32_t STATUS_VIEW_CHANGE = 1;
 const uint32_t STATUS_RECOVERING = 2;
 
+const uint32_t CLUSTER_SIZE = 3;
+const uint32_t QUORUM_SIZE = 2;
+
+const uint64_t NONFRAG_MAGIC = 0x20050318;
+
 // Paxos-state
-int32_t idx;
+uint32_t myIdx;
 uint32_t view;
 uint32_t status;
+uint64_t lastOp, lastCommitted;
+Log log;
+std::map<std::pair<uint64_t, uint64_t>, std::map<int, specpaxos::vr::proto::PrepareOKMessage> > messages;
+
+std::map<uint64_t, netaddr> clientAddresses;
+struct ClientTableEntry {
+	uint64_t lastReqId;
+	bool replied;
+	specpaxos::vr::proto::ReplyMessage reply;
+};
+std::map<uint64_t, ClientTableEntry> clientTable;
 
 
 // ------------------------------------ server-side code ------------------------------------
@@ -65,6 +200,70 @@ uint32_t status;
 bool AmLeader() {
 	return view == 0;
 }
+
+// ipv4: convert string to u32.
+int StringToAddr(const char *str, uint32_t *addr) {
+	uint8_t a, b, c, d;
+
+	if(sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) != 4) {
+		puts("Failed in parsing ipv4 addr");
+		exit(-1);
+		return -EINVAL;
+	}
+
+	*addr = MAKE_IP_ADDR(a, b, c, d);
+	return 0;
+}
+
+void UpdateClientTable(const specpaxos::Request &req) {
+    ClientTableEntry &entry = clientTable[req.clientid()];
+
+    if (entry.lastReqId > req.clientreqid()) {
+		puts("Wrong Client-side request number.");
+		exit(-1);
+	}
+
+    if (entry.lastReqId == req.clientreqid()) {
+        return;
+    }
+
+    entry.lastReqId = req.clientreqid();
+    entry.replied = false;
+    entry.reply.Clear();
+}
+
+static size_t SerializeMessage(const ::google::protobuf::Message &m, char **out) {
+    std::string data = m.SerializeAsString();
+    std::string type = m.GetTypeName();
+    size_t typeLen = type.length();
+    size_t dataLen = data.length();
+    ssize_t totalLen = (sizeof(uint32_t) +
+                       typeLen + sizeof(typeLen) +
+                       dataLen + sizeof(dataLen));
+
+    char *buf = new char[totalLen];
+
+    char *ptr = buf;
+    *(uint32_t *)ptr = NONFRAG_MAGIC;
+    ptr += sizeof(uint32_t);
+    *((size_t *) ptr) = typeLen;
+    ptr += sizeof(size_t);
+    ASSERT(ptr-buf < totalLen);
+    ASSERT(ptr+typeLen-buf < totalLen);
+    memcpy(ptr, type.c_str(), typeLen);
+    ptr += typeLen;
+    
+    *((size_t *) ptr) = dataLen;
+    ptr += sizeof(size_t);
+    ASSERT(ptr-buf < totalLen);
+    ASSERT(ptr+dataLen-buf == totalLen);
+    memcpy(ptr, data.c_str(), dataLen);
+    ptr += dataLen;
+    
+    *out = buf;
+    return totalLen;
+}
+
 
 void HandleRequest(const netaddr &remote,
                    const specpaxos::vr::proto::RequestMessage &msg) {
@@ -80,7 +279,64 @@ void HandleRequest(const netaddr &remote,
         return;
     }
 
-	// now I'm the leader.
+	// Save the client's address
+	clientAddresses.erase(msg.req().clientid());
+    clientAddresses.insert(
+        std::pair<uint64_t, netaddr>(
+            msg.req().clientid(),
+			remote));
+	
+	// Check the client table to see if this is a duplicate request
+    auto kv = clientTable.find(msg.req().clientid());
+    if (kv != clientTable.end()) {
+		puts("Duplicated request!");
+		exit(-1);
+	}
+
+	// Update the client table
+	UpdateClientTable(msg.req());
+
+
+	specpaxos::Request request;
+	request.set_op(msg.req().op());
+	request.set_clientid(msg.req().clientid());
+	request.set_clientreqid(msg.req().clientreqid());
+
+	/* Assign it an opnum */ // increasing by one.
+	++lastOp;
+
+	/* Add the request to my log */
+	viewstamp_t v; // WARNING: didn't initialize.
+	log.Append(v, request, LOG_STATE_PREPARED); // state of this entry in log is PREPARED.
+
+    /* Send prepare messages */
+    specpaxos::vr::proto::PrepareMessage p;
+    p.set_view(view);
+    p.set_opnum(lastOp);
+    p.set_batchstart(lastOp);
+
+    // batch the reqs in this interval, and send it all.
+    for (opnum_t i = lastOp; i <= lastOp; i++) {
+        specpaxos::Request *r = p.add_request();
+        const LogEntry *entry = log.Find(i);
+        ASSERT(entry != NULL);
+        ASSERT(entry->viewstamp.view == view);
+        ASSERT(entry->viewstamp.opnum == i);
+        *r = entry->request;
+    }
+
+	// broadcast this message to all followers.
+	char *buf;
+    size_t msgLen = SerializeMessage(p, &buf);
+	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
+		if (myIdx == view % CLUSTER_SIZE) continue;
+		ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+		if (ret == -1) {
+			puts("Failed to broadcast prepare messages to followers.");
+			break;
+		}
+	}
+	delete [] buf;
 }
 
 void HandlePrepare(const netaddr &remote,
@@ -108,7 +364,42 @@ void HandlePrepare(const netaddr &remote,
 		exit(-1);
     }
 
+	if (msg.opnum() <= lastOp) { // stale Prepare message.
+        puts("Ignoring PREPARE; already prepared that operation");
+		exit(-1);
+    }
 
+	if (msg.batchstart() > lastOp+1) { 
+		puts("Prepare message loss/reorder!");
+		exit(-1);
+        return;
+    }
+
+	/* Add operations to the log */
+    opnum_t op = msg.batchstart()-1;
+    for (auto &req : msg.request()) {
+        op++;
+        if (op <= lastOp) continue;
+        lastOp++;
+        log.Append(viewstamp_t(msg.view(), op), req, LOG_STATE_PREPARED);
+        UpdateClientTable(req);
+    }
+    ASSERT(op == msg.opnum());
+    
+    /* Build reply and send it to the leader */
+    specpaxos::vr::proto::PrepareOKMessage reply;
+    reply.set_view(msg.view());
+    reply.set_opnum(msg.opnum());
+    reply.set_replicaidx(myIdx);
+
+
+	char *buf;
+    size_t msgLen = SerializeMessage(reply, &buf);
+	ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[view % CLUSTER_SIZE]);
+	if (ret == -1) {
+        puts("Failed to send PrepareOK message to leader");
+	}
+	delete [] buf;
 }
 
 void HandlePrepareOK(const netaddr &remote, 
@@ -137,6 +428,48 @@ void HandlePrepareOK(const netaddr &remote,
         return;
     }
 
+
+	viewstamp_t vs = {msg.view(), msg.opnum()};
+	
+	std::map<int, specpaxos::vr::proto::PrepareOKMessage> &vsmessages = messages[std::make_pair(vs.view, vs.opnum)];
+	if (vsmessages.find(msg.replicaidx()) != vsmessages.end()) {
+		// This is a duplicate message
+
+		// But we'll ignore that, replace the old message from
+		// this replica, and proceed.
+		//
+		// XXX Is this the right thing to do? It is for
+		// speculative replies in SpecPaxos...
+	}
+    vsmessages[msg.replicaidx()] = msg;
+    int count = vsmessages.size();
+	if (count >= QUORUM_SIZE - 1) {
+		if (count >= QUORUM_SIZE) return;
+
+		ASSERT(msg.opnum() == lastCommitted + 1);
+		++lastCommitted;
+		/*
+         * Send COMMIT message to the other replicas.
+         *
+         * This can be done asynchronously, so it really ought to be
+         * piggybacked on the next PREPARE or something.
+         */
+        specpaxos::vr::proto::CommitMessage cm;
+        cm.set_view(view);
+        cm.set_opnum(lastCommitted);
+
+		char *buf;
+		size_t msgLen = SerializeMessage(cm, &buf);
+		for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
+			if (myIdx == view % CLUSTER_SIZE) continue;
+			ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+			if (ret == -1) {
+				puts("Failed to send COMMIT message to all replicas.");
+				break;
+			}
+		}
+		delete [] buf;
+	}
 }
 
 void HandleCommit(const netaddr &remote,
@@ -163,6 +496,20 @@ void HandleCommit(const netaddr &remote,
         puts("Unexpected COMMIT: I'm the leader of this view");
 		exit(-1);
     }
+
+	if (msg.opnum() <= lastCommitted) {
+        puts("Ignoring COMMIT; already committed that operation");
+		exit(-1);
+        return;
+    }
+
+    if (msg.opnum() > lastOp) { // we don't have this request...
+		puts("Commit nonexistent request");
+		exit(-1);
+        return;
+    }
+
+	// CommitUpTo(msg.opnum());
 }
 
 void ReceiveMessage(const netaddr &remote, const std::string &type, const std::string &data) {
@@ -200,6 +547,7 @@ void ServerHandler(void *arg) {
 	// initialize Paxos's state
 	view = 0;
 	status = STATUS_NORMAL;
+	lastOp = 0;
 
 	// like event-driven, a loop pooling packets. 
     char buf[10005];
@@ -220,42 +568,76 @@ void ServerHandler(void *arg) {
 
 
 // ------------------------------------ client-side code ------------------------------------
+void SendRequest(std::string request_str, uint32_t clientid, uint32_t &clientReqId, int32_t &count) {
+    specpaxos::vr::proto::RequestMessage reqMsg;
+    reqMsg.mutable_req()->set_op(request_str);
+    reqMsg.mutable_req()->set_clientid(clientid);
+    reqMsg.mutable_req()->set_clientreqid(clientReqId);
+    
+    // XXX Try sending only to (what we think is) the leader first
+    transport->SendMessageToAll(this, reqMsg);
+    
+    requestTimeout->Reset();
+
+	int len = rand() % 50 + 50;
+	ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
+	if (ret == -1) {
+		puts("Failed sending request!");fflush(stdout);
+		exit(0);
+	}
+}
+
+void HandleReply(const netaddr &remote,
+                 const specpaxos::vr::proto::ReplyMessage &msg) {
+    if (pendingRequest == NULL) {
+        Warning("Received reply when no request was pending");
+        return;
+    }
+    if (msg.clientreqid() != ) {
+        ("Received reply for a different request");
+        return;
+    }
+	
+}
+
+void ClientReceiveMessage(const netaddr &remote, const std::string &type, const std::string &data) {
+    static specpaxos::vr::proto::ReplyMessage reply;
+    
+    if (type == reply.GetTypeName()) {
+        reply.ParseFromString(data);
+        HandleReply(remote, reply);
+    } else {
+		puts("Unknow message in client!");
+		exit(-1);
+    }
+}
 
 void ClientHandler(void *arg) {
 	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
 	if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
+	// initialize state.
+	std::string request_str = std::string("sdf");
+	uint32_t clientid = 0;
+	uint32_t clientReqId = 0;
+
 	// a simplified client, need to add warmup in the future.
-	int cnt = 10;
-	char buf[3000];
-	while (--cnt) {
-		int len = rand() % 50 + 50;
-		printf("Sending: %d\n", len);
-		ssize_t ret = udp_send(buf, len, cltaddr, srvaddr[0]);
-		if (ret == -1) {
-			puts("Failed sending request!");fflush(stdout);
-			exit(0);
-		}
-		ret = c->ReadFrom(buf, 3e3, &raddr);
-		printf("Received: %ld\n", ret);
-		// received one request.
+	int32_t total_requests = 10;
+	char buf[10005];
+
+	SendRequest(request_str, clientid, clientReqId, total_requests);
+	while (total_requests) {
+		netaddr raddr;
+        ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
+
+        char *payload = buf;
+        uint64_t typeLen = *(uint64_t *)payload;
+        payload = payload + sizeof(uint64_t);
+        std::string type(payload, typeLen);
+        std::string data(payload + typeLen, ret - sizeof(uint64_t) - typeLen);
+        ClientReceiveMessage(raddr, type, data);
 	}
 	return;
-}
-
-
-// ipv4: convert string to u32.
-int StringToAddr(const char *str, uint32_t *addr) {
-	uint8_t a, b, c, d;
-
-	if(sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) != 4) {
-		puts("Failed in parsing ipv4 addr");
-		exit(-1);
-		return -EINVAL;
-	}
-
-	*addr = MAKE_IP_ADDR(a, b, c, d);
-	return 0;
 }
 
 } // anonymous namespace
@@ -283,7 +665,7 @@ int main(int argc, char *argv[]) {
 	std::string cmd = argv[2];
 	if (cmd.compare("server") == 0) {
 		puts("I'm running server!");
-		idx = std::stoi(argv[3], nullptr, 0);
+		myIdx = std::stoi(argv[3], nullptr, 0);
 		ret = runtime_init(argv[1], ServerHandler, NULL);
 		if (ret) {
 			printf("Server: failed to start runtime\n");
