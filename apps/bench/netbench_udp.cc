@@ -33,8 +33,8 @@ typedef uint64_t view_t;
 typedef uint64_t opnum_t;
 
 #define ASSERT(x, msg) do {\
-        printf("%s\n", msg);\
 	if (!(x)) {\
+        printf("%s\n", msg);\
 		exit(-1); \
     }\
 } while (0)
@@ -121,7 +121,6 @@ public:
     }
 
     LogEntry & Append(viewstamp_t vs, const specpaxos::Request &req, LogEntryState state) {
-        printf("%ld %ld\n", vs.opnum, start);
 		if (entries.empty()) {
 			ASSERT(vs.opnum == start, "Log entry");
 		} else {
@@ -138,7 +137,6 @@ public:
 		return entries.back();
 	}
     LogEntry * Find(opnum_t opnum) {
-        printf("Log idx: %ld, start: %ld, size: %ld\n", opnum, start,entries.size() );
 		if (entries.empty()) {
 			return NULL;
 		}
@@ -206,7 +204,7 @@ std::map<uint64_t, ClientTableEntry> clientTable;
 // ------------------------------------ server-side code ------------------------------------
 
 bool AmLeader() {
-	return view == 0;
+	return view % CLUSTER_SIZE == myIdx;
 }
 
 // ipv4: convert string to u32.
@@ -352,8 +350,7 @@ void HandleRequest(const netaddr &remote,
     }
 	
 	if (!AmLeader()) { // only leader should handle request.
-        puts("Ignoring request because I'm not the leader");
-        exit(-1);
+        // puts("Ignoring request because I'm not the leader");
         return;
     }
 
@@ -409,7 +406,8 @@ void HandleRequest(const netaddr &remote,
 	char *buf;
     size_t msgLen = SerializeMessage(p, &buf);
 	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
-		if (myIdx == view % CLUSTER_SIZE) continue;
+		if (i == myIdx) continue;
+        // printf("Leader %d sent prepare msg to replica %d\n", myIdx, i);
 		ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
 		if (ret == -1) {
 			puts("Failed to broadcast prepare messages to followers.");
@@ -541,7 +539,7 @@ void HandlePrepareOK(const netaddr &remote,
 		char *buf;
 		size_t msgLen = SerializeMessage(cm, &buf);
 		for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
-			if (myIdx == view % CLUSTER_SIZE) continue;
+			if (i == myIdx) continue;
 			ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
 			if (ret == -1) {
 				puts("Failed to send COMMIT message to all replicas.");
@@ -598,7 +596,7 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
     static specpaxos::vr::proto::PrepareOKMessage prepareOK;
     static specpaxos::vr::proto::CommitMessage commit;
     
-    std::cout<<"Leader received " << type<<" message!\n"<<std::endl;
+    std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
 
     if (type == request.GetTypeName()) { // HandleRequest, the leader's duty.
         request.ParseFromString(data);
