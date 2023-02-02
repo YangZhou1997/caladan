@@ -368,8 +368,15 @@ void HandleRequest(const netaddr &remote,
 	// Check the client table to see if this is a duplicate request
     auto kv = clientTable.find(msg.req().clientid());
     if (kv != clientTable.end()) {
-		puts("Duplicated request!");
-		exit(-1);
+        const ClientTableEntry &entry = kv->second;
+        if (msg.req().clientreqid() < entry.lastReqId) {
+            puts("Ignoring stale request");
+		    exit(-1);
+        }
+        if (msg.req().clientreqid() == entry.lastReqId) {
+		    puts("Duplicated request!");
+            exit(-1);
+        }
 	}
 
 	// Update the client table
@@ -660,7 +667,7 @@ void SendRequest(uint32_t clientid) {
     specpaxos::vr::proto::RequestMessage reqMsg;
     reqMsg.mutable_req()->set_op(request_str[clientid]);
     reqMsg.mutable_req()->set_clientid(clientid);
-    reqMsg.mutable_req()->set_clientreqid(clientReqId[clientid]);
+    reqMsg.mutable_req()->set_clientreqid(++clientReqId[clientid]);
 
     char *buf;
     size_t msgLen = SerializeMessage(reqMsg, &buf);
@@ -723,6 +730,7 @@ void ClientMain(uint32_t clientid, uint16_t port) {
         std::string type, data;
         DecodePacket(buf, ret, type, data);
         ClientReceiveMessage(clientid, raddr, type, data);
+        --total_requests;
 	}
 	return;
 }
