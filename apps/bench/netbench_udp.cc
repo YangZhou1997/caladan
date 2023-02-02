@@ -28,6 +28,7 @@ extern "C" {
 #include <numeric>
 #include <random>
 #include <string>
+#include <unistd.h>
 
 typedef uint64_t view_t;
 typedef uint64_t opnum_t;
@@ -303,8 +304,11 @@ void CommitUpTo(opnum_t upto) { // we can apply these requests in state machine!
         }
 
         specpaxos::vr::proto::ReplyMessage reply;
+        // WARNING: you need to set reply. 
+        reply.set_reply("asd123www");
         // if we have an upper-layer application.
         // Execute(lastCommitted, entry->request, reply);
+
 
         reply.set_view(entry->viewstamp.view);
         reply.set_opnum(entry->viewstamp.opnum);
@@ -651,6 +655,8 @@ std::string request_str[CLUSTER_SIZE];
 uint32_t clientReqId[CLUSTER_SIZE];
 
 void SendRequest(uint32_t clientid) {
+    // sleep(1);
+
     specpaxos::vr::proto::RequestMessage reqMsg;
     reqMsg.mutable_req()->set_op(request_str[clientid]);
     reqMsg.mutable_req()->set_clientid(clientid);
@@ -695,12 +701,12 @@ void ClientReceiveMessage(const uint32_t clientid,
     }
 }
 
-void ClientMain(uint32_t clientid, uint8_t port) {
+void ClientMain(uint32_t clientid, uint16_t port) {
 	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
 	if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
 	// initialize state.
-    request_str[clientid] = std::string("sdf");
+    request_str[clientid] = std::string("asd123www");
     clientReqId[clientid] = 0;
 
 	// a simplified client, need to add warmup in the future.
@@ -710,7 +716,9 @@ void ClientMain(uint32_t clientid, uint8_t port) {
 	SendRequest(clientid);
 	while (total_requests) {
 		netaddr raddr;
+        puts("I'm in receiving!");
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
+        printf("Received one message(length: %ld)!\n", ret);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
@@ -720,7 +728,7 @@ void ClientMain(uint32_t clientid, uint8_t port) {
 }
 
 void ClientHandler(void *arg) {
-    ClientMain(0, 12345);
+    ClientMain(0, kNetbenchPort);
     /*
     // spawn one thread for each client.
     for (uint32_t i = 0; i < threads; ++i) {
