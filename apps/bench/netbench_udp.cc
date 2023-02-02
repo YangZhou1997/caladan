@@ -268,6 +268,27 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m, char **out)
     return totalLen;
 }
 
+static void DecodePacket(const char *buf, size_t sz, std::string &type, std::string &msg) {
+    uint32_t magic = *(uint32_t*)buf;
+    ASSERT(magic == NONFRAG_MAGIC);
+
+    ssize_t ssz = sz - sizeof(uint32_t);
+    const char *ptr = buf;
+    size_t typeLen = *((size_t *)ptr);
+    ptr += sizeof(size_t);
+    ASSERT(ptr-buf < ssz);
+    ASSERT(ptr+typeLen-buf < ssz);
+    type = std::string(ptr, typeLen);
+    ptr += typeLen;
+
+    size_t msgLen = *((size_t *)ptr);
+    ptr += sizeof(size_t);
+    ASSERT(ptr-buf < ssz);
+    ASSERT(ptr+msgLen-buf <= ssz);
+    msg = std::string(ptr, msgLen);
+    ptr += msgLen;
+}
+
 void CommitUpTo(opnum_t upto) { // we can apply these requests in state machine!
     while (lastCommitted < upto) {
         lastCommitted++;
@@ -608,11 +629,8 @@ void ServerHandler(void *arg) {
         netaddr raddr;
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
 
-        char *payload = buf;
-        uint64_t typeLen = *(uint64_t *)payload;
-        payload = payload + sizeof(uint64_t);
-        std::string type(payload, typeLen);
-        std::string data(payload + typeLen, ret - sizeof(uint64_t) - typeLen);
+        std::string type, data;
+        DecodePacket(buf, ret, type, data);
         ReceiveMessage(raddr, type, data);
 	}
 	puts("Quited from loop!");
@@ -686,21 +704,20 @@ void ClientMain(uint32_t clientid, uint8_t port) {
 		netaddr raddr;
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
 
-        char *payload = buf;
-        uint64_t typeLen = *(uint64_t *)payload;
-        payload = payload + sizeof(uint64_t);
-        std::string type(payload, typeLen);
-        std::string data(payload + typeLen, ret - sizeof(uint64_t) - typeLen);
+        std::string type, data;
+        DecodePacket(buf, ret, type, data);
         ClientReceiveMessage(clientid, raddr, type, data);
 	}
 	return;
 }
 
 void ClientHandler(void *arg) {
+    ClientMain(0, 12345);
+    /*
     // spawn one thread for each client.
     for (uint32_t i = 0; i < threads; ++i) {
         
-    }
+    }*/
 }
 
 } // anonymous namespace
