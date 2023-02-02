@@ -32,9 +32,11 @@ extern "C" {
 typedef uint64_t view_t;
 typedef uint64_t opnum_t;
 
-#define ASSERT(x) do {\
-	if (!(x)) \
+#define ASSERT(x, msg) do {\
+        printf("%s\n", msg);\
+	if (!(x)) {\
 		exit(-1); \
+    }\
 } while (0)
 
 
@@ -119,10 +121,11 @@ public:
     }
 
     LogEntry & Append(viewstamp_t vs, const specpaxos::Request &req, LogEntryState state) {
+        printf("%ld %ld\n", vs.opnum, start);
 		if (entries.empty()) {
-			ASSERT(vs.opnum == start);
+			ASSERT(vs.opnum == start, "Log entry");
 		} else {
-			ASSERT(vs.opnum == LastOpnum()+1);
+			ASSERT(vs.opnum == LastOpnum()+1, "Log entry");
 		}
 
 		std::string prevHash = LastHash();
@@ -135,6 +138,7 @@ public:
 		return entries.back();
 	}
     LogEntry * Find(opnum_t opnum) {
+        printf("Log idx: %ld, start: %ld, size: %ld\n", opnum, start,entries.size() );
 		if (entries.empty()) {
 			return NULL;
 		}
@@ -148,14 +152,14 @@ public:
 		}
 
 		LogEntry *entry = &entries[opnum-start];
-		ASSERT(entry->viewstamp.opnum == opnum);
+		ASSERT(entry->viewstamp.opnum == opnum, "Log entry find");
 		return entry;
 	}
     
 private:
     std::vector<LogEntry> entries;
 	std::string initialHash;
-    opnum_t start;
+    opnum_t start = 1;
     bool useHash;
 };
 
@@ -252,15 +256,15 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m, char **out)
     ptr += sizeof(uint32_t);
     *((size_t *) ptr) = typeLen;
     ptr += sizeof(size_t);
-    ASSERT(ptr-buf < totalLen);
-    ASSERT(ptr+typeLen-buf < totalLen);
+    ASSERT(ptr-buf < totalLen, "Serialized Message typeLen.");
+    ASSERT(ptr+typeLen-buf < totalLen, "Serialized Message typestr.");
     memcpy(ptr, type.c_str(), typeLen);
     ptr += typeLen;
     
     *((size_t *) ptr) = dataLen;
     ptr += sizeof(size_t);
-    ASSERT(ptr-buf < totalLen);
-    ASSERT(ptr+dataLen-buf == totalLen);
+    ASSERT(ptr-buf < totalLen, "Serialized Message dataLen.");
+    ASSERT(ptr+dataLen-buf == totalLen, "Serialized Message datastr.");
     memcpy(ptr, data.c_str(), dataLen);
     ptr += dataLen;
     
@@ -270,21 +274,21 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m, char **out)
 
 static void DecodePacket(const char *buf, size_t sz, std::string &type, std::string &msg) {
     uint32_t magic = *(uint32_t*)buf;
-    ASSERT(magic == NONFRAG_MAGIC);
+    ASSERT(magic == NONFRAG_MAGIC, "NonFrag bits check.");
 
-    ssize_t ssz = sz - sizeof(uint32_t);
-    const char *ptr = buf;
+    ssize_t ssz = sz;
+    const char *ptr = buf + sizeof(uint32_t);
     size_t typeLen = *((size_t *)ptr);
     ptr += sizeof(size_t);
-    ASSERT(ptr-buf < ssz);
-    ASSERT(ptr+typeLen-buf < ssz);
+    ASSERT(ptr-buf < ssz, "Decode typeLen.");
+    ASSERT(ptr+typeLen-buf < ssz, "Decode typeStr.");
     type = std::string(ptr, typeLen);
     ptr += typeLen;
 
     size_t msgLen = *((size_t *)ptr);
     ptr += sizeof(size_t);
-    ASSERT(ptr-buf < ssz);
-    ASSERT(ptr+msgLen-buf <= ssz);
+    ASSERT(ptr-buf < ssz, "Decode dataLen.");
+    ASSERT(ptr+msgLen-buf <= ssz, "Decode dataStr.");
     msg = std::string(ptr, msgLen);
     ptr += msgLen;
 }
@@ -380,7 +384,9 @@ void HandleRequest(const netaddr &remote,
 	++lastOp;
 
 	/* Add the request to my log */
-	viewstamp_t v; // WARNING: didn't initialize.
+	viewstamp_t v;
+    v.view = view;
+    v.opnum = lastOp;
 	log.Append(v, request, LOG_STATE_PREPARED); // state of this entry in log is PREPARED.
 
     /* Send prepare messages */
@@ -393,9 +399,9 @@ void HandleRequest(const netaddr &remote,
     for (opnum_t i = lastOp; i <= lastOp; i++) {
         specpaxos::Request *r = p.add_request();
         const LogEntry *entry = log.Find(i);
-        ASSERT(entry != NULL);
-        ASSERT(entry->viewstamp.view == view);
-        ASSERT(entry->viewstamp.opnum == i);
+        ASSERT(entry != NULL, "A in HandleRequest.");
+        ASSERT(entry->viewstamp.view == view, "B in HandleRequest.");
+        ASSERT(entry->viewstamp.opnum == i, "C in HandleRequest.");
         *r = entry->request;
     }
 
@@ -458,7 +464,7 @@ void HandlePrepare(const netaddr &remote,
         log.Append(viewstamp_t(msg.view(), op), req, LOG_STATE_PREPARED);
         UpdateClientTable(req);
     }
-    ASSERT(op == msg.opnum());
+    ASSERT(op == msg.opnum(), "Op checking in HandlePrepare.");
     
     /* Build reply and send it to the leader */
     specpaxos::vr::proto::PrepareOKMessage reply;
@@ -520,7 +526,7 @@ void HandlePrepareOK(const netaddr &remote,
 	if (count >= QUORUM_SIZE - 1) {
 		if (count >= QUORUM_SIZE) return;
 
-		ASSERT(msg.opnum() == lastCommitted + 1);
+		ASSERT(msg.opnum() == lastCommitted + 1, "Op checking in HandlePrepareOK.");
         CommitUpTo(msg.opnum());
 		/*
          * Send COMMIT message to the other replicas.
@@ -592,6 +598,8 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
     static specpaxos::vr::proto::PrepareOKMessage prepareOK;
     static specpaxos::vr::proto::CommitMessage commit;
     
+    std::cout<<"Leader received " << type<<" message!\n"<<std::endl;
+
     if (type == request.GetTypeName()) { // HandleRequest, the leader's duty.
         request.ParseFromString(data);
         HandleRequest(remote, request);
@@ -627,7 +635,9 @@ void ServerHandler(void *arg) {
     char buf[10005];
     while (true) {
         netaddr raddr;
+        puts("I'm in receiving!");
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
+        printf("Received one message(length: %ld)!\n", ret);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
@@ -773,5 +783,8 @@ Client:
     sudo ./apps/bench/netbench_udp client.config client
 Server: 
     sudo ./iokerneld simple
-    sudo ./apps/bench/netbench_udp server.config server idx
+        replica 0: sudo ./apps/bench/netbench_udp replica0.config server 0
+        replica 1: sudo ./apps/bench/netbench_udp replica1.config server 1
+        replica 2: sudo ./apps/bench/netbench_udp replica2.config server 2
+
 */
