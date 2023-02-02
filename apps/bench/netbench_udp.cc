@@ -171,19 +171,21 @@ constexpr uint64_t kDiscardSamples = 1000;
 // The maximum lateness to tolerate before dropping egress samples.
 constexpr uint64_t kMaxCatchUpUS = 5;
 
-// the number of worker threads to spawn.
-uint32_t threads;
-netaddr cltaddr;
-netaddr srvaddr[10];
-
 const uint32_t STATUS_NORMAL = 0;
 const uint32_t STATUS_VIEW_CHANGE = 1;
 const uint32_t STATUS_RECOVERING = 2;
 
+const uint32_t MAX_CLIENT_NUM = 100;
 const uint32_t CLUSTER_SIZE = 3;
 const uint32_t QUORUM_SIZE = 2;
 
 const uint64_t NONFRAG_MAGIC = 0x20050318;
+
+
+// the number of worker threads to spawn.
+uint32_t threads;
+netaddr cltaddr[MAX_CLIENT_NUM];
+netaddr srvaddr[100];
 
 // Paxos-state
 uint32_t myIdx;
@@ -659,7 +661,7 @@ void ServerHandler(void *arg) {
 
 // ------------------------------------ client-side code ------------------------------------
 std::string request_str[CLUSTER_SIZE];
-uint32_t clientReqId[CLUSTER_SIZE];
+uint64_t clientReqId[CLUSTER_SIZE];
 
 void SendRequest(uint32_t clientid) {
     // sleep(1);
@@ -672,7 +674,7 @@ void SendRequest(uint32_t clientid) {
     char *buf;
     size_t msgLen = SerializeMessage(reqMsg, &buf);
 	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
-		ssize_t ret = udp_send(buf, msgLen, cltaddr, srvaddr[i]);
+		ssize_t ret = udp_send(buf, msgLen, cltaddr[clientid], srvaddr[i]);
 		if (ret == -1) {
 			puts("Failed sending request!");
 			break;
@@ -689,8 +691,6 @@ void HandleReply(const uint32_t clientid,
         puts("Received reply for a different request");
         return;
     }
-    // Closed-loop.
-    SendRequest(clientid);
 }
 
 void ClientReceiveMessage(const uint32_t clientid,
@@ -708,7 +708,8 @@ void ClientReceiveMessage(const uint32_t clientid,
     }
 }
 
-void ClientMain(uint32_t clientid, uint16_t port) {
+std::vector<double> ClientMain(uint32_t clientid, uint16_t port) {
+    cltaddr[clientid].port = port;
 	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
 	if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
@@ -720,28 +721,37 @@ void ClientMain(uint32_t clientid, uint16_t port) {
 	int32_t total_requests = 10;
 	char buf[10005];
 
-	SendRequest(clientid);
-	while (total_requests) {
+    std::vector<double> latencies;
+    // Closed-loop.
+	while (total_requests--) {
 		netaddr raddr;
-        puts("I'm in receiving!");
+        // puts("I'm in receiving!");
+	    SendRequest(clientid);
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
-        printf("Received one message(length: %ld)!\n", ret);
+        // printf("Received one message(length: %ld)!\n", ret);
+        latencies.emplace_back(total_requests);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
         ClientReceiveMessage(clientid, raddr, type, data);
-        --total_requests;
 	}
-	return;
+	return latencies;
 }
 
 void ClientHandler(void *arg) {
-    ClientMain(0, kNetbenchPort);
-    /*
+    std::vector<rt::Thread> th;
+    std::unique_ptr<std::vector<double>> samples[threads];
+
     // spawn one thread for each client.
     for (uint32_t i = 0; i < threads; ++i) {
-        
-    }*/
+        th.emplace_back(rt::Thread([&, i]{
+            auto v = ClientMain(i, kNetbenchPort + i);
+            samples[i].reset(new std::vector<double>(std::move(v)));
+        }));
+    }
+
+    for (auto& t: th) t.Join();
+
 }
 
 } // anonymous namespace
@@ -755,7 +765,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Setting cluster.
-	StringToAddr("10.10.1.2", &cltaddr.ip);
+	StringToAddr("10.10.1.2", &cltaddr[0].ip);
 	StringToAddr("10.10.1.3", &srvaddr[0].ip);
 	StringToAddr("10.10.1.4", &srvaddr[1].ip);
 	StringToAddr("10.10.1.1", &srvaddr[2].ip);
@@ -763,8 +773,8 @@ int main(int argc, char *argv[]) {
 	StringToAddr("10.10.1.5", &srvaddr[4].ip);
 	StringToAddr("10.10.1.7", &srvaddr[5].ip);
 	StringToAddr("10.10.1.8", &srvaddr[6].ip);
-	cltaddr.port = kNetbenchPort;
-	for (int i = 0; i < 7; ++i) srvaddr[i].port = kNetbenchPort;
+    for (uint32_t i = 1; i < MAX_CLIENT_NUM; ++i) cltaddr[i].ip = cltaddr[0].ip;
+	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) srvaddr[i].port = kNetbenchPort;
 
 	std::string cmd = argv[2];
 	if (cmd.compare("server") == 0) {
@@ -780,6 +790,7 @@ int main(int argc, char *argv[]) {
 		return -EINVAL;
 	}
 
+    threads = std::stoi(argv[3], nullptr, 0);
 	ret = runtime_init(argv[1], ClientHandler, NULL);
 	if (ret) {
 		printf("failed to start runtime\n");
@@ -794,7 +805,7 @@ Compiling your code:
 
 Client: 
     sudo ./iokerneld simple
-    sudo ./apps/bench/netbench_udp client.config client
+    sudo ./apps/bench/netbench_udp client.config client threads
 Server: 
     sudo ./iokerneld simple
         replica 0: sudo ./apps/bench/netbench_udp replica0.config server 0
