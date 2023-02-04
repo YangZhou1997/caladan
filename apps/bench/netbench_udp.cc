@@ -463,7 +463,7 @@ void HandlePrepare(const netaddr &remote,
     }
 
 	if (msg.batchstart() > lastOp+1) { 
-		puts("Prepare message loss/reorder!");
+		printf("Prepare message loss/reorder! %ld %ld\n", lastOp, msg.batchstart());
 		exit(-1);
         return;
     }
@@ -597,7 +597,7 @@ void HandleCommit(const netaddr &remote,
     }
 
     if (msg.opnum() > lastOp) { // we don't have this request...
-		puts("Commit nonexistent request");
+		printf("Commit nonexistent request %ld %ld", msg.opnum(), lastOp);
 		exit(-1);
         return;
     }
@@ -664,9 +664,9 @@ void ServerHandler(void *arg) {
 // ------------------------------------ client-side code ------------------------------------
 std::string request_str[CLUSTER_SIZE];
 uint64_t clientReqId[CLUSTER_SIZE];
-bool warmup_finished[CLUSTER_SIZE];
-uint64_t time_stamp[CLUSTER_SIZE];
-std::vector<uint64_t> latencies[CLUSTER_SIZE];
+bool warmup_finished[MAX_CLIENT_NUM];
+uint64_t time_stamp[MAX_CLIENT_NUM];
+std::vector<uint64_t> latencies[MAX_CLIENT_NUM];
 
 void SendRequest(uint32_t clientid) {
     specpaxos::vr::proto::RequestMessage reqMsg;
@@ -837,7 +837,7 @@ Compiling your code:
 Client: 
     sudo ./iokerneld simple
     sudo ./apps/bench/netbench_udp client.config client warmup n threads
-    sudo ./apps/bench/netbench_udp client.config client 0 100 1
+    sudo ./apps/bench/netbench_udp client.config client 5 2000000 1
 Server: 
     sudo ./iokerneld simple
         replica 0: sudo ./apps/bench/netbench_udp replica0.config server 0
