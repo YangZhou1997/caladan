@@ -184,6 +184,8 @@ const uint64_t NONFRAG_MAGIC = 0x20050318;
 
 // the number of worker threads to spawn.
 uint32_t threads;
+uint64_t warmup;
+uint64_t n;
 netaddr cltaddr[MAX_CLIENT_NUM];
 netaddr srvaddr[100];
 
@@ -609,7 +611,7 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
     static specpaxos::vr::proto::PrepareOKMessage prepareOK;
     static specpaxos::vr::proto::CommitMessage commit;
     
-    std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
+    // std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
 
     if (type == request.GetTypeName()) { // HandleRequest, the leader's duty.
         request.ParseFromString(data);
@@ -646,9 +648,9 @@ void ServerHandler(void *arg) {
     char buf[10005];
     while (true) {
         netaddr raddr;
-        puts("I'm in receiving!");
+        // puts("I'm in receiving!");
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
-        printf("Received one message(length: %ld)!\n", ret);
+        // printf("Received one message(length: %ld)!\n", ret);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
@@ -662,10 +664,11 @@ void ServerHandler(void *arg) {
 // ------------------------------------ client-side code ------------------------------------
 std::string request_str[CLUSTER_SIZE];
 uint64_t clientReqId[CLUSTER_SIZE];
+bool warmup_finished[CLUSTER_SIZE];
+uint64_t time_stamp[CLUSTER_SIZE];
+std::vector<uint64_t> latencies[CLUSTER_SIZE];
 
 void SendRequest(uint32_t clientid) {
-    // sleep(1);
-
     specpaxos::vr::proto::RequestMessage reqMsg;
     reqMsg.mutable_req()->set_op(request_str[clientid]);
     reqMsg.mutable_req()->set_clientid(clientid);
@@ -673,11 +676,13 @@ void SendRequest(uint32_t clientid) {
 
     char *buf;
     size_t msgLen = SerializeMessage(reqMsg, &buf);
+
+    time_stamp[clientid] = microtime();
 	for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
 		ssize_t ret = udp_send(buf, msgLen, cltaddr[clientid], srvaddr[i]);
 		if (ret == -1) {
-			puts("Failed sending request!");
-			break;
+			puts("Failed sending request!");fflush(stdout);
+            exit(-1);
 		}
 	}
 	delete [] buf;
@@ -690,6 +695,10 @@ void HandleReply(const uint32_t clientid,
     if (msg.clientreqid() != clientReqId[clientid]) {
         puts("Received reply for a different request");
         return;
+    }
+
+    if (warmup_finished[clientid]) {
+        latencies[clientid].push_back(microtime() - time_stamp[clientid]);
     }
 }
 
@@ -708,34 +717,44 @@ void ClientReceiveMessage(const uint32_t clientid,
     }
 }
 
-std::vector<double> ClientMain(uint32_t clientid, uint16_t port) {
+// return time of finishing n requests.
+double ClientMain(uint32_t clientid, uint16_t port) {
     cltaddr[clientid].port = port;
 	std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
 	if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
 
 	// initialize state.
-    request_str[clientid] = std::string("asd123www");
+    warmup_finished[clientid] = false;
+    request_str[clientid] = std::string("request");
     clientReqId[clientid] = 0;
 
 	// a simplified client, need to add warmup in the future.
-	int32_t total_requests = 10;
+	uint64_t total_requests = n;
 	char buf[10005];
 
-    std::vector<double> latencies;
+    uint64_t start_time = microtime();
+    uint64_t l_time, r_time, count = 0;
     // Closed-loop.
-	while (total_requests--) {
+	while (total_requests) {
+        ++count;
 		netaddr raddr;
-        // puts("I'm in receiving!");
 	    SendRequest(clientid);
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
-        // printf("Received one message(length: %ld)!\n", ret);
-        latencies.emplace_back(total_requests);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
         ClientReceiveMessage(clientid, raddr, type, data);
+
+        if (warmup_finished[clientid]) {
+            --total_requests;
+        } else if (microtime() - start_time > warmup) {
+            printf("Completed warmup period of %ld seconds with %ld requests\n", warmup / 1000000, count);
+            warmup_finished[clientid] = true;
+            l_time = microtime();
+        }
 	}
-	return latencies;
+    r_time = microtime();
+    return r_time - l_time;
 }
 
 void ClientHandler(void *arg) {
@@ -745,13 +764,23 @@ void ClientHandler(void *arg) {
     // spawn one thread for each client.
     for (uint32_t i = 0; i < threads; ++i) {
         th.emplace_back(rt::Thread([&, i]{
-            auto v = ClientMain(i, kNetbenchPort + i);
-            samples[i].reset(new std::vector<double>(std::move(v)));
+            uint64_t v = ClientMain(i, kNetbenchPort + i);
+            printf("Completed %ld requests in %.6f seconds.\n", n, (double)v * 0.000001);
         }));
     }
 
     for (auto& t: th) t.Join();
+    
+    std::vector<uint64_t> latency;
+    for (uint32_t i = 0; i < threads; ++i) {
+        latency.insert(latency.end(), latencies[i].begin(), latencies[i].end());
+    }
+    std::sort(latency.begin(), latency.end());
 
+    printf("Median latency is %ld us\n", latency[(uint32_t)(n * threads * 0.5)]);
+    printf("90th percentile latency is %ld us\n", latency[(uint32_t)(n * threads * 0.90)]);
+    printf("95th percentile latency is %ld us\n", latency[(uint32_t)(n * threads * 0.95)]);
+    printf("99th percentile latency is %ld us\n", latency[(uint32_t)(n * threads * 0.99)]);
 }
 
 } // anonymous namespace
@@ -790,7 +819,9 @@ int main(int argc, char *argv[]) {
 		return -EINVAL;
 	}
 
-    threads = std::stoi(argv[3], nullptr, 0);
+    warmup = std::stoi(argv[3], nullptr, 0) * 1000000;
+    n = std::stoi(argv[4], nullptr, 0);
+    threads = std::stoi(argv[5], nullptr, 0);
 	ret = runtime_init(argv[1], ClientHandler, NULL);
 	if (ret) {
 		printf("failed to start runtime\n");
@@ -805,7 +836,8 @@ Compiling your code:
 
 Client: 
     sudo ./iokerneld simple
-    sudo ./apps/bench/netbench_udp client.config client threads
+    sudo ./apps/bench/netbench_udp client.config client warmup n threads
+    sudo ./apps/bench/netbench_udp client.config client 0 100 1
 Server: 
     sudo ./iokerneld simple
         replica 0: sudo ./apps/bench/netbench_udp replica0.config server 0
