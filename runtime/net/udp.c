@@ -15,7 +15,7 @@
 #include "defs.h"
 #include "waitq.h"
 
-#define UDP_IN_DEFAULT_CAP	512
+#define UDP_IN_DEFAULT_CAP	51200
 #define UDP_OUT_DEFAULT_CAP	2048
 
 unsigned int udp_payload_size;

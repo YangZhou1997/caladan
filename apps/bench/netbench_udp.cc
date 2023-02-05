@@ -611,7 +611,7 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
     static specpaxos::vr::proto::PrepareOKMessage prepareOK;
     static specpaxos::vr::proto::CommitMessage commit;
     
-    // std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
+    std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
 
     if (type == request.GetTypeName()) { // HandleRequest, the leader's duty.
         request.ParseFromString(data);
