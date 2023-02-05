@@ -189,6 +189,9 @@ uint64_t n;
 netaddr cltaddr[MAX_CLIENT_NUM];
 netaddr srvaddr[100];
 
+// statistics
+uint64_t num_request, num_prepare, num_prepareOK, num_commit;
+
 // Paxos-state
 uint32_t myIdx;
 uint32_t view;
@@ -611,18 +614,22 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
     static specpaxos::vr::proto::PrepareOKMessage prepareOK;
     static specpaxos::vr::proto::CommitMessage commit;
     
-    std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
+    // std::cout<<(AmLeader()? "Leader ":"Follower ")<<myIdx<<" received " << type<<" message!\n"<<std::endl;
 
     if (type == request.GetTypeName()) { // HandleRequest, the leader's duty.
+        ++num_request;
         request.ParseFromString(data);
         HandleRequest(remote, request);
     } else if (type == prepare.GetTypeName()) { // HandlePrepare, in backup replica.
+        ++num_prepare;
         prepare.ParseFromString(data);
         HandlePrepare(remote, prepare);
     } else if (type == prepareOK.GetTypeName()) { // HandlePrepareOK, the leader's duty.
+        ++num_prepareOK;
         prepareOK.ParseFromString(data);
         HandlePrepareOK(remote, prepareOK);
     } else if (type == commit.GetTypeName()) { // HandleCommit, in back replica.
+        ++num_commit;
         commit.ParseFromString(data);
         HandleCommit(remote, commit);
     } else {
@@ -638,19 +645,20 @@ void ReceiveMessage(const netaddr &remote, const std::string &type, const std::s
 void ServerHandler(void *arg) {
     std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
     if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
+    c->SetBuffers(1<<18, 1<<18);
 
 	// initialize Paxos's state
 	view = 0;
 	status = STATUS_NORMAL;
 	lastOp = 0;
 
+    num_request = num_prepare = num_prepareOK = num_commit = 0;
+
 	// like event-driven, a loop pooling packets. 
     char buf[10005];
     while (true) {
         netaddr raddr;
-        // puts("I'm in receiving!");
         ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
-        // printf("Received one message(length: %ld)!\n", ret);
 
         std::string type, data;
         DecodePacket(buf, ret, type, data);
@@ -662,8 +670,8 @@ void ServerHandler(void *arg) {
 
 
 // ------------------------------------ client-side code ------------------------------------
-std::string request_str[CLUSTER_SIZE];
-uint64_t clientReqId[CLUSTER_SIZE];
+std::string request_str[MAX_CLIENT_NUM];
+uint64_t clientReqId[MAX_CLIENT_NUM];
 bool warmup_finished[MAX_CLIENT_NUM];
 uint64_t time_stamp[MAX_CLIENT_NUM];
 std::vector<uint64_t> latencies[MAX_CLIENT_NUM];
@@ -783,6 +791,13 @@ void ClientHandler(void *arg) {
     printf("99th percentile latency is %ld us\n", latency[(uint32_t)(n * threads * 0.99)]);
 }
 
+void my_handler(int s){
+    printf("\n\nReceived %ld requst.\n", num_request);
+    printf("Received %ld prepare.\n", num_prepare);
+    printf("Received %ld prepareOK.\n", num_prepareOK);
+    printf("Received %ld commit.\n", num_commit);
+    exit(1);
+}
 } // anonymous namespace
 
 int main(int argc, char *argv[]) {
@@ -792,6 +807,13 @@ int main(int argc, char *argv[]) {
 		std::cerr << "usage: [cfg_file] [cmd] ..." << std::endl;
 		return -EINVAL;
 	}
+
+    // capture ctrl-c behavior.
+    struct sigaction sigIntHandler;
+    sigIntHandler.sa_handler = my_handler;
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+    sigaction(SIGINT, &sigIntHandler, NULL);
 
 	// Setting cluster.
 	StringToAddr("10.10.1.2", &cltaddr[0].ip);
@@ -837,7 +859,7 @@ Compiling your code:
 Client: 
     sudo ./iokerneld simple
     sudo ./apps/bench/netbench_udp client.config client warmup n threads
-    sudo ./apps/bench/netbench_udp client.config client 5 2000000 1
+    sudo ./apps/bench/netbench_udp client.config client 5 200000 5
 Server: 
     sudo ./iokerneld simple
         replica 0: sudo ./apps/bench/netbench_udp replica0.config server 0
