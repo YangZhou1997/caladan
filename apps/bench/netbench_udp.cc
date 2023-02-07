@@ -179,8 +179,8 @@ const uint32_t STATUS_VIEW_CHANGE = 1;
 const uint32_t STATUS_RECOVERING = 2;
 
 const uint32_t MAX_CLIENT_NUM = 100;
-const uint32_t CLUSTER_SIZE = 3;
-const uint32_t QUORUM_SIZE = 2;
+const uint32_t CLUSTER_SIZE = 5;
+const uint32_t QUORUM_SIZE = 3;
 
 const uint64_t NONFRAG_MAGIC = 0x20050318;
 
