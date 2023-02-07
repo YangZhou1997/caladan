@@ -767,7 +767,7 @@ void ReceiveMessage(const netaddr &remote, const std::string &type,
 
 // the main function of Server.
 void ServerHandler(void *arg) {
-  FillArpTable();
+  // FillArpTable();
 
   // std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
   std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen(srvaddr[myIdx]));
@@ -896,7 +896,7 @@ double ClientMain(uint32_t clientid, uint16_t port) {
 }
 
 void ClientHandler(void *arg) {
-  FillArpTable();
+  // FillArpTable();
 
   std::vector<rt::Thread> th;
   std::unique_ptr<std::vector<double>> samples[threads];
