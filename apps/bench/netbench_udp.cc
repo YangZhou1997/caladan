@@ -23,6 +23,7 @@ extern "C" {
 #include <memory>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -173,6 +174,7 @@ using sec = std::chrono::duration<double, std::micro>;
 constexpr uint64_t kDiscardSamples = 1000;
 // The maximum lateness to tolerate before dropping egress samples.
 constexpr uint64_t kMaxCatchUpUS = 5;
+constexpr uint64_t kUdpSendRetryUs = 10;
 
 const uint32_t STATUS_NORMAL = 0;
 const uint32_t STATUS_VIEW_CHANGE = 1;
@@ -211,6 +213,100 @@ struct ClientTableEntry {
   specpaxos::vr::proto::ReplyMessage reply;
 };
 std::map<uint64_t, ClientTableEntry> clientTable;
+
+void ListenFunc(std::unique_ptr<rt::TcpConn> inc) {
+  nbench_req req = {kMagic, 0};
+  int ret;
+retry:
+  ret = inc->ReadFull(&req, sizeof(req));
+  if (ret < 0) {
+    // puts("TCP couldn't read from remote.");
+    goto retry;
+  }
+  ASSERT(req.magic == kMagic, "magic error");
+
+retry2:
+  ret = inc->WriteFull(&req, sizeof(req));
+  if (ret < 0) {
+    // puts("TCP couldn't write to remote.");
+    goto retry2;
+  }
+}
+
+void FillArpTable() {
+  netaddr peeraddr[CLUSTER_SIZE + 1];
+  peeraddr[CLUSTER_SIZE].ip = cltaddr[0].ip;
+  peeraddr[CLUSTER_SIZE].port = kNetbenchPort;
+  for (int i = 0; i < CLUSTER_SIZE; i++) {
+    peeraddr[i] = srvaddr[i];
+  }
+
+  auto listener = rt::Thread([&]() {
+    std::unique_ptr<rt::TcpQueue> q(
+        rt::TcpQueue::Listen({0, kNetbenchPort}, 4096));
+    if (unlikely(q == nullptr))
+      panic("couldn't listen for control connections");
+
+    int num_conns = 0;
+    std::vector<rt::Thread> th;
+    std::set<uint32_t> connected_ips;
+    while (num_conns != CLUSTER_SIZE) {
+      rt::TcpConn *c = q->Accept();
+      if (c == nullptr) panic("couldn't accept a connection");
+      auto rip = c->RemoteAddr().ip;
+      if (connected_ips.find(rip) != connected_ips.end()) {
+        // repeated conn, ignore
+        continue;
+      }
+      connected_ips.insert(rip);
+      th.emplace_back(
+          rt::Thread([=] { ListenFunc(std::unique_ptr<rt::TcpConn>(c)); }));
+      log_warn("Accept one conn with %x", c->RemoteAddr().ip);
+      num_conns++;
+    }
+    for (auto &t : th) {
+      t.Join();
+    }
+    log_warn("Finish Listen");
+  });
+
+  rt::Thread([&]() {
+    std::vector<std::unique_ptr<rt::TcpConn>> conns;
+    for (int i = 0; i < CLUSTER_SIZE + 1; ++i) {
+      if (i == myIdx) continue;
+      std::unique_ptr<rt::TcpConn> outc;
+    retry:
+      outc =
+          std::unique_ptr<rt::TcpConn>(rt::TcpConn::Dial({0, 0}, peeraddr[i]));
+      if (unlikely(outc == nullptr)) {
+        rt::Sleep(500 * rt::kMilliseconds);
+        goto retry;
+      }
+
+      nbench_req req = {kMagic, 0};
+      int ret;
+    retry2:
+      ret = outc->WriteFull(&req, sizeof(req));
+      if (ret < 0) {
+        // puts("TCP couldn't write to remote.");
+        goto retry2;
+      }
+    retry3:
+      ret = outc->ReadFull(&req, sizeof(req));
+      if (ret < 0) {
+        // puts("TCP couldn't read from remote.");
+        goto retry3;
+      }
+      ASSERT(req.magic == kMagic, "magic error");
+      log_warn("Finish one conn with %x", outc->RemoteAddr().ip);
+    }
+    log_warn("Finish Dial");
+  }).Join();
+
+  listener.Join();
+
+  log_warn("Finish FillArpTable");
+}
 
 // ------------------------------------ server-side code
 // ------------------------------------
@@ -302,8 +398,9 @@ static void DecodePacket(const char *buf, size_t sz, std::string &type,
   ptr += msgLen;
 }
 
-void CommitUpTo(
-    opnum_t upto) {  // we can apply these requests in state machine!
+void CommitUpTo(opnum_t upto,
+                std::unique_ptr<rt::UdpConn>
+                    &c) {  // we can apply these requests in state machine!
   while (lastCommitted < upto) {
     lastCommitted++;
 
@@ -345,9 +442,14 @@ void CommitUpTo(
     if (iter != clientAddresses.end()) {
       char *buf;
       size_t msgLen = SerializeMessage(reply, &buf);
-      ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], iter->second);
+      ssize_t ret = 0;
+    retry:
+      // ret = udp_send(buf, msgLen, srvaddr[myIdx], iter->second);
+      ret = c->WriteTo(buf, msgLen, &iter->second);
       if (ret < 0) {
-        puts("Failed to send reply message to client");
+        log_warn_ratelimited("Failed to send reply message to client");
+        rt::Sleep(kUdpSendRetryUs);
+        goto retry;
       }
       delete[] buf;
     }
@@ -355,7 +457,8 @@ void CommitUpTo(
 }
 
 void HandleRequest(const netaddr &remote,
-                   const specpaxos::vr::proto::RequestMessage &msg) {
+                   const specpaxos::vr::proto::RequestMessage &msg,
+                   std::unique_ptr<rt::UdpConn> &c) {
   if (status != STATUS_NORMAL) {  // don't handle request.
     puts("Ignoring request due to abnormal status");
     exit(-1);
@@ -426,17 +529,23 @@ void HandleRequest(const netaddr &remote,
   for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
     if (i == myIdx) continue;
     // printf("Leader %d sent prepare msg to replica %d\n", myIdx, i);
-    ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+    ssize_t ret = 0;
+  retry:
+    // ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+    ret = c->WriteTo(buf, msgLen, &srvaddr[i]);
     if (ret < 0) {
-      puts("Failed to broadcast prepare messages to followers.");
-      break;
+      log_warn_ratelimited(
+          "Failed to broadcast prepare messages to followers.");
+      rt::Sleep(kUdpSendRetryUs);
+      goto retry;
     }
   }
   delete[] buf;
 }
 
 void HandlePrepare(const netaddr &remote,
-                   const specpaxos::vr::proto::PrepareMessage &msg) {
+                   const specpaxos::vr::proto::PrepareMessage &msg,
+                   std::unique_ptr<rt::UdpConn> &c) {
   if (status != STATUS_NORMAL) {  // no interaction.
     puts("Ignoring PREPARE due to abnormal status");
     exit(-1);
@@ -491,16 +600,21 @@ void HandlePrepare(const netaddr &remote,
 
   char *buf;
   size_t msgLen = SerializeMessage(reply, &buf);
-  ssize_t ret =
-      udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[view % CLUSTER_SIZE]);
+  ssize_t ret = 0;
+retry:
+  // ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[view % CLUSTER_SIZE]);
+  ret = c->WriteTo(buf, msgLen, &srvaddr[view % CLUSTER_SIZE]);
   if (ret < 0) {
-    puts("Failed to send PrepareOK message to leader");
+    log_warn_ratelimited("Failed to send PrepareOK message to leader");
+    rt::Sleep(kUdpSendRetryUs);
+    goto retry;
   }
   delete[] buf;
 }
 
 void HandlePrepareOK(const netaddr &remote,
-                     const specpaxos::vr::proto::PrepareOKMessage &msg) {
+                     const specpaxos::vr::proto::PrepareOKMessage &msg,
+                     std::unique_ptr<rt::UdpConn> &c) {
   if (status != STATUS_NORMAL) {
     puts("Ignoring PREPAREOK due to abnormal status");
     exit(-1);
@@ -544,7 +658,7 @@ void HandlePrepareOK(const netaddr &remote,
     if (count >= QUORUM_SIZE) return;
 
     ASSERT(msg.opnum() == lastCommitted + 1, "Op checking in HandlePrepareOK.");
-    CommitUpTo(msg.opnum());
+    CommitUpTo(msg.opnum(), c);
     /*
      * Send COMMIT message to the other replicas.
      *
@@ -559,10 +673,14 @@ void HandlePrepareOK(const netaddr &remote,
     size_t msgLen = SerializeMessage(cm, &buf);
     for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
       if (i == myIdx) continue;
-      ssize_t ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+      ssize_t ret = 0;
+    retry:
+      // ret = udp_send(buf, msgLen, srvaddr[myIdx], srvaddr[i]);
+      ret = c->WriteTo(buf, msgLen, &srvaddr[i]);
       if (ret < 0) {
-        puts("Failed to send COMMIT message to all replicas.");
-        break;
+        log_warn_ratelimited("Failed to send COMMIT message to all replicas.");
+        rt::Sleep(kUdpSendRetryUs);
+        goto retry;
       }
     }
     delete[] buf;
@@ -570,7 +688,8 @@ void HandlePrepareOK(const netaddr &remote,
 }
 
 void HandleCommit(const netaddr &remote,
-                  const specpaxos::vr::proto::CommitMessage &msg) {
+                  const specpaxos::vr::proto::CommitMessage &msg,
+                  std::unique_ptr<rt::UdpConn> &c) {
   if (status != STATUS_NORMAL) {
     puts("Ignoring COMMIT due to abnormal status");
     exit(-1);
@@ -606,11 +725,11 @@ void HandleCommit(const netaddr &remote,
     return;
   }
 
-  CommitUpTo(msg.opnum());
+  CommitUpTo(msg.opnum(), c);
 }
 
 void ReceiveMessage(const netaddr &remote, const std::string &type,
-                    const std::string &data) {
+                    const std::string &data, std::unique_ptr<rt::UdpConn> &c) {
   static specpaxos::vr::proto::RequestMessage request;
   static specpaxos::vr::proto::PrepareMessage prepare;
   static specpaxos::vr::proto::PrepareOKMessage prepareOK;
@@ -622,21 +741,21 @@ void ReceiveMessage(const netaddr &remote, const std::string &type,
   if (type == request.GetTypeName()) {  // HandleRequest, the leader's duty.
     ++num_request;
     request.ParseFromString(data);
-    HandleRequest(remote, request);
+    HandleRequest(remote, request, c);
   } else if (type ==
              prepare.GetTypeName()) {  // HandlePrepare, in backup replica.
     ++num_prepare;
     prepare.ParseFromString(data);
-    HandlePrepare(remote, prepare);
+    HandlePrepare(remote, prepare, c);
   } else if (type ==
              prepareOK.GetTypeName()) {  // HandlePrepareOK, the leader's duty.
     ++num_prepareOK;
     prepareOK.ParseFromString(data);
-    HandlePrepareOK(remote, prepareOK);
+    HandlePrepareOK(remote, prepareOK, c);
   } else if (type == commit.GetTypeName()) {  // HandleCommit, in back replica.
     ++num_commit;
     commit.ParseFromString(data);
-    HandleCommit(remote, commit);
+    HandleCommit(remote, commit, c);
   } else {
     printf("Received unexpected message type in VR proto: %s\n", type.c_str());
     fflush(stdout);
@@ -648,9 +767,12 @@ void ReceiveMessage(const netaddr &remote, const std::string &type,
 
 // the main function of Server.
 void ServerHandler(void *arg) {
-  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
+  FillArpTable();
+
+  // std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, kNetbenchPort}));
+  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen(srvaddr[myIdx]));
   if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
-  c->SetBuffers(1 << 18, 1 << 18);
+  // c->SetBuffers(1 << 18, 1 << 18);
 
   // initialize Paxos's state
   view = 0;
@@ -667,7 +789,7 @@ void ServerHandler(void *arg) {
 
     std::string type, data;
     DecodePacket(buf, ret, type, data);
-    ReceiveMessage(raddr, type, data);
+    ReceiveMessage(raddr, type, data, c);
   }
   puts("Quited from loop!");
   return;
@@ -681,7 +803,7 @@ bool warmup_finished[MAX_CLIENT_NUM];
 uint64_t time_stamp[MAX_CLIENT_NUM];
 std::vector<uint64_t> latencies[MAX_CLIENT_NUM];
 
-void SendRequest(uint32_t clientid) {
+void SendRequest(uint32_t clientid, std::unique_ptr<rt::UdpConn> &c) {
   specpaxos::vr::proto::RequestMessage reqMsg;
   reqMsg.mutable_req()->set_op(request_str[clientid]);
   reqMsg.mutable_req()->set_clientid(clientid);
@@ -692,11 +814,14 @@ void SendRequest(uint32_t clientid) {
 
   time_stamp[clientid] = microtime();
   for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) {
-    ssize_t ret = udp_send(buf, msgLen, cltaddr[clientid], srvaddr[i]);
+    ssize_t ret = 0;
+  retry:
+    // ret = udp_send(buf, msgLen, cltaddr[clientid], srvaddr[i]);
+    ret = c->WriteTo(buf, msgLen, &srvaddr[i]);
     if (ret < 0) {
-      puts("Failed sending request!");
-      fflush(stdout);
-      exit(-1);
+      log_warn_ratelimited("Failed sending request!");
+      rt::Sleep(kUdpSendRetryUs);
+      goto retry;
     }
   }
   delete[] buf;
@@ -730,8 +855,10 @@ void ClientReceiveMessage(const uint32_t clientid, const netaddr &remote,
 // return time of finishing n requests.
 double ClientMain(uint32_t clientid, uint16_t port) {
   cltaddr[clientid].port = port;
-  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
+  // std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen({0, port}));
+  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen(cltaddr[clientid]));
   if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
+  // c->SetBuffers(1 << 18, 1 << 18);
 
   // initialize state.
   warmup_finished[clientid] = false;
@@ -748,7 +875,7 @@ double ClientMain(uint32_t clientid, uint16_t port) {
   while (total_requests) {
     ++count;
     netaddr raddr;
-    SendRequest(clientid);
+    SendRequest(clientid, c);
     ssize_t ret = c->ReadFrom(buf, 1e4, &raddr);
 
     std::string type, data;
@@ -769,6 +896,8 @@ double ClientMain(uint32_t clientid, uint16_t port) {
 }
 
 void ClientHandler(void *arg) {
+  FillArpTable();
+
   std::vector<rt::Thread> th;
   std::unique_ptr<std::vector<double>> samples[threads];
 
@@ -826,11 +955,11 @@ int main(int argc, char *argv[]) {
   StringToAddr("10.10.1.2", &cltaddr[0].ip);
   StringToAddr("10.10.1.3", &srvaddr[0].ip);
   StringToAddr("10.10.1.4", &srvaddr[1].ip);
-  StringToAddr("10.10.1.1", &srvaddr[2].ip);
+  StringToAddr("10.10.1.5", &srvaddr[2].ip);
   StringToAddr("10.10.1.6", &srvaddr[3].ip);
-  StringToAddr("10.10.1.5", &srvaddr[4].ip);
-  StringToAddr("10.10.1.7", &srvaddr[5].ip);
-  StringToAddr("10.10.1.8", &srvaddr[6].ip);
+  StringToAddr("10.10.1.7", &srvaddr[4].ip);
+  StringToAddr("10.10.1.8", &srvaddr[5].ip);
+  StringToAddr("10.10.1.9", &srvaddr[6].ip);
   for (uint32_t i = 1; i < MAX_CLIENT_NUM; ++i) cltaddr[i].ip = cltaddr[0].ip;
   for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) srvaddr[i].port = kNetbenchPort;
 
@@ -847,6 +976,9 @@ int main(int argc, char *argv[]) {
     std::cerr << "invalid command: " << cmd << std::endl;
     return -EINVAL;
   }
+
+  puts("I'm running client!");
+  myIdx = CLUSTER_SIZE;
 
   warmup = std::stoi(argv[3], nullptr, 0) * 1000000;
   n = std::stoi(argv[4], nullptr, 0);
