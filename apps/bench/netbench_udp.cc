@@ -951,15 +951,26 @@ int main(int argc, char *argv[]) {
   sigIntHandler.sa_flags = 0;
   sigaction(SIGINT, &sigIntHandler, NULL);
 
-  // Setting cluster.
-  StringToAddr("10.10.1.2", &cltaddr[0].ip);
-  StringToAddr("10.10.1.3", &srvaddr[0].ip);
-  StringToAddr("10.10.1.4", &srvaddr[1].ip);
-  StringToAddr("10.10.1.5", &srvaddr[2].ip);
-  StringToAddr("10.10.1.6", &srvaddr[3].ip);
-  StringToAddr("10.10.1.7", &srvaddr[4].ip);
+  // Setting cluster (for caladan replicas)
+  // StringToAddr("10.10.1.7", &cltaddr[0].ip);
+  // StringToAddr("10.10.1.3", &srvaddr[0].ip);
+  // StringToAddr("10.10.1.4", &srvaddr[1].ip);
+  // StringToAddr("10.10.1.5", &srvaddr[2].ip);
+  // StringToAddr("10.10.1.6", &srvaddr[3].ip);
+  // StringToAddr("10.10.1.7", &srvaddr[4].ip);
+  // StringToAddr("10.10.1.8", &srvaddr[5].ip);
+  // StringToAddr("10.10.1.9", &srvaddr[6].ip);
+
+  // Setting cluster (for linux replicas)
+  StringToAddr("10.10.1.7", &cltaddr[0].ip);
+  StringToAddr("10.10.1.4", &srvaddr[0].ip);
+  StringToAddr("10.10.1.2", &srvaddr[1].ip);
+  StringToAddr("10.10.1.3", &srvaddr[2].ip);
+  StringToAddr("10.10.1.5", &srvaddr[3].ip);
+  StringToAddr("10.10.1.6", &srvaddr[4].ip);
   StringToAddr("10.10.1.8", &srvaddr[5].ip);
   StringToAddr("10.10.1.9", &srvaddr[6].ip);
+  
   for (uint32_t i = 1; i < MAX_CLIENT_NUM; ++i) cltaddr[i].ip = cltaddr[0].ip;
   for (uint32_t i = 0; i < CLUSTER_SIZE; ++i) srvaddr[i].port = kNetbenchPort;
 

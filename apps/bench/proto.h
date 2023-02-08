@@ -3,7 +3,7 @@
 #pragma once
 
 // The netbench server responds to this port.
-constexpr uint64_t kNetbenchPort = 8001;
+constexpr uint64_t kNetbenchPort = 12345;
 
 constexpr uint32_t kMagic = 0x6e626368; // 'nbch'
 constexpr uint32_t kKill = 0x6b696c6c; // 'kill'

@@ -1,78 +1,77 @@
 extern "C" {
 #include <base/log.h>
+#include <net/ip.h>
 #undef min
 #undef max
 }
 
-#include "runtime.h"
-#include "thread.h"
-#include "sync.h"
-#include "timer.h"
-#include "fake_worker.h"
-
-#include <iostream>
 #include <chrono>
+#include <iostream>
+#include <memory>
+
+#include "net.h"
+#include "runtime.h"
+#include "sync.h"
+#include "thread.h"
+#include "timer.h"
 
 namespace {
 
-int threads;
-uint64_t n;
-std::string worker_spec;
+// ipv4: convert string to u32.
+int StringToAddr(const char *str, uint32_t *addr) {
+  uint8_t a, b, c, d;
 
-void MainHandler(void *arg) {
-  rt::WaitGroup wg(1);
-  uint64_t cnt[threads] = {};
-
-  for (int i = 0; i < threads; ++i) {
-    rt::Spawn([&,i](){
-      auto *w = FakeWorkerFactory(worker_spec);
-      if (w == nullptr) {
-        std::cerr << "Failed to create worker." << std::endl;
-        exit(1);
-      }
-
-      while (true) {
-        w->Work(n);
-        cnt[i]++;
-        rt::Yield();
-      }
-    });
+  if (sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) != 4) {
+    puts("Failed in parsing ipv4 addr");
+    exit(-1);
+    return -EINVAL;
   }
 
-  rt::Spawn([&](){
-    uint64_t last_total = 0;
-    auto last = std::chrono::steady_clock::now();
-    while (1) {
-      rt::Sleep(rt::kSeconds);
-      auto now = std::chrono::steady_clock::now();
-      uint64_t total = 0;
-      double duration = std::chrono::duration_cast<
-        std::chrono::duration<double>>(now - last).count();
-      for (int i = 0; i < threads; i++) total += cnt[i];
-      log_info("%f", static_cast<double>(total - last_total) / duration);
-      last_total = total;
-      last = now;
-    }
-  });
-
-  // never returns
-  wg.Wait();
+  *addr = MAKE_IP_ADDR(a, b, c, d);
+  return 0;
 }
 
-} // anonymous namespace
+void MainHandler(void *arg) {
+  netaddr cltaddr;
+  StringToAddr("10.10.1.7", &cltaddr.ip);
+  cltaddr.port = 12345;
+
+  netaddr srvaddr;
+  StringToAddr("10.10.1.2", &srvaddr.ip);
+  srvaddr.port = 12345;
+
+  std::unique_ptr<rt::UdpConn> c(rt::UdpConn::Listen(cltaddr));
+  if (unlikely(c == nullptr)) panic("couldn't listen for control connections");
+
+  const char *data_to_send = "Gangadhar Hi Shaktimaan hai";
+
+  int ret = c->WriteTo(data_to_send, strlen(data_to_send), &srvaddr);
+  if (ret <= 0) {
+    log_warn("Failed sending request!");
+  }
+
+  // received echoed data back
+  char buffer[100];
+  netaddr raddr;
+  ret = c->ReadFrom(buffer, sizeof(buffer), &raddr);
+  if (ret <= 0) {
+    log_warn("Failed recving request!");
+  }
+
+
+  buffer[ret] = '\0';
+  log_warn("recieved: '%s'", buffer);
+}
+
+}  // anonymous namespace
 
 int main(int argc, char *argv[]) {
   int ret;
 
-  if (argc != 5) {
-    std::cerr << "usage: [config_file] [#threads] [#n] [worker_spec]"
-              << std::endl;
+  if (argc != 2) {
+    std::cerr << "usage: [config_file]" << std::endl;
     return -EINVAL;
   }
-
-  threads = std::stoi(argv[2], nullptr, 0);
-  n = std::stoul(argv[3], nullptr, 0);
-  worker_spec = std::string(argv[4]);
 
   ret = runtime_init(argv[1], MainHandler, NULL);
   if (ret) {
