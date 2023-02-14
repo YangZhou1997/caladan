@@ -185,6 +185,7 @@ const uint32_t CLUSTER_SIZE = 5;
 const uint32_t QUORUM_SIZE = 3;
 
 const uint64_t NONFRAG_MAGIC = 0x20050318;
+const uint64_t ELECTRODE_HEADER_LENGTH = 12;
 
 // the number of worker threads to spawn.
 uint32_t threads;
@@ -351,7 +352,7 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m,
   size_t typeLen = type.length();
   size_t dataLen = data.length();
   ssize_t totalLen = (sizeof(uint32_t) + typeLen + sizeof(typeLen) + dataLen +
-                      sizeof(dataLen));
+                      sizeof(dataLen)) + ELECTRODE_HEADER_LENGTH;
 
   char *buf = new char[totalLen];
 
@@ -364,6 +365,9 @@ static size_t SerializeMessage(const ::google::protobuf::Message &m,
   ASSERT(ptr + typeLen - buf < totalLen, "Serialized Message typestr.");
   memcpy(ptr, type.c_str(), typeLen);
   ptr += typeLen;
+
+  // skip 12 bytes.
+  ptr += ELECTRODE_HEADER_LENGTH;
 
   *((size_t *)ptr) = dataLen;
   ptr += sizeof(size_t);
@@ -389,6 +393,9 @@ static void DecodePacket(const char *buf, size_t sz, std::string &type,
   ASSERT(ptr + typeLen - buf < ssz, "Decode typeStr.");
   type = std::string(ptr, typeLen);
   ptr += typeLen;
+
+  // skip 12 bytes.
+  ptr += ELECTRODE_HEADER_LENGTH;
 
   size_t msgLen = *((size_t *)ptr);
   ptr += sizeof(size_t);
